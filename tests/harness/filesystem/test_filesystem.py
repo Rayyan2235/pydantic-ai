@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import io
 import os
 import posixpath
 import re
 import socket
 import stat
+import zipfile
 from collections.abc import Sequence
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
+from typing import get_args
 
 import anyio
 import anyio.lowlevel
@@ -22,16 +25,21 @@ from pydantic_ai import Agent
 from pydantic_ai.capabilities import AbstractCapability, LocalWorkspace, on_event
 from pydantic_ai.exceptions import ModelRetry, ToolFailed, UserError
 from pydantic_ai.messages import (
+    AudioMediaType,
     BinaryContent,
+    DocumentMediaType,
+    ImageMediaType,
     ModelMessage,
     ModelRequest,
     ModelResponse,
     TextPart,
     ToolCallPart,
     ToolReturnPart,
+    VideoMediaType,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.profiles import ModelProfile
 from pydantic_ai.tools import RunContext
 from pydantic_ai.usage import RunUsage
 from pydantic_ai.workspaces import (
@@ -699,6 +707,90 @@ class TestAccessPatterns:
             await ts.read_file('hello.txt', workspace=ws)
 
 
+def _zip(*names: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w') as archive:
+        for name in names:
+            archive.writestr(name, '<x/>')
+    return buffer.getvalue()
+
+
+_MP4 = b'\x00\x00\x00\x18ftypisom' + bytes(12)
+_DOCX = _zip('[Content_Types].xml', 'word/document.xml')
+_ASF_HEADER_GUID = bytes.fromhex('3026b2758e66cf11a6d900aa0062ce6c')
+_ASF_VIDEO_MEDIA_GUID = bytes.fromhex('c0ef19bc4d5bcf11a8fd00805f5c442b')
+
+MEDIA_FILES = [
+    pytest.param(b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR', 'image/png', id='png'),
+    pytest.param(b'\xff\xd8\xff\xe0\x00\x10JFIF', 'image/jpeg', id='jpeg'),
+    pytest.param(b'GIF89a\x01\x00\x01\x00', 'image/gif', id='gif'),
+    pytest.param(b'RIFF\x24\x00\x00\x00WEBPVP8 ', 'image/webp', id='webp'),
+    # A PDF often has no null byte near the start, so it is recognized by its signature, not as binary.
+    pytest.param(b'%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n', 'application/pdf', id='pdf'),
+    pytest.param(_MP4, 'video/mp4', id='mp4'),
+    pytest.param(b'\x00\x00\x00\x14ftypqt  ' + bytes(8), 'video/quicktime', id='mov'),
+    pytest.param(b'\x00\x00\x00\x14ftyp3gp5' + bytes(8), 'video/3gpp', id='3gp'),
+    pytest.param(b'\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01\x42\x82\x84webm' + bytes(16), 'video/webm', id='webm'),
+    pytest.param(b'\x1a\x45\xdf\xa3\xa3\x42\x86\x81\x01\x42\x82\x88matroska' + bytes(16), 'video/x-matroska', id='mkv'),
+    # `webm` in a Void element before the DocType does not decide: only the DocType does.
+    pytest.param(
+        b'\x1a\x45\xdf\xa3\xa8\xec\x84webm\x42\x82\x88matroska' + bytes(16),
+        'video/x-matroska',
+        id='ebml-webm-elsewhere',
+    ),
+    pytest.param(b'FLV\x01\x05\x00\x00\x00\x09' + bytes(8), 'video/x-flv', id='flv'),
+    pytest.param(b'\x00\x00\x01\xba\x44\x00\x04\x00' + bytes(8), 'video/mpeg', id='mpeg-ps'),
+    pytest.param(b'\x00\x00\x01\xb3\x16\x00\xf0\x15' + bytes(8), 'video/mpeg', id='mpeg-es'),
+    pytest.param(
+        _ASF_HEADER_GUID + (54).to_bytes(8, 'little') + bytes(6) + _ASF_VIDEO_MEDIA_GUID + bytes(8),
+        'video/x-ms-wmv',
+        id='wmv',
+    ),
+    pytest.param(_DOCX, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', id='docx'),
+    pytest.param(
+        _zip('[Content_Types].xml', 'xl/workbook.xml'),
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        id='xlsx',
+    ),
+]
+
+NOT_MEDIA_FILES = [
+    pytest.param(_zip('a.txt'), id='zip-generic'),
+    pytest.param(_zip('word/document.xml'), id='zip-no-content-types'),
+    pytest.param(_zip('[Content_Types].xml', 'ppt/presentation.xml'), id='pptx'),
+    pytest.param(b'PK\x03\x04' + bytes(40), id='zip-corrupt'),
+    pytest.param(_DOCX[: len(_DOCX) // 2], id='zip-truncated'),
+    pytest.param(b'\x00\x00\x00\x18ftypM4A ' + bytes(12), id='ftyp-m4a'),
+    pytest.param(b'\x00\x00\x00\x18ftypheic' + bytes(12), id='ftyp-heic'),
+    pytest.param(b'\x00\x00\x00\x18ftypavif' + bytes(12), id='ftyp-avif'),
+    pytest.param(b'\x00\x00\x00\x18ftyp3g2a' + bytes(12), id='ftyp-3g2'),
+    pytest.param(b'\x1a\x45\xdf\xa3\x9b\x42\x86\x81\x01\x42\x82\x84abcd' + bytes(16), id='ebml-unknown'),
+    pytest.param(b'FLV\x01\x04\x00\x00\x00\x09' + bytes(8), id='flv-audio-only'),
+    pytest.param(_ASF_HEADER_GUID + (40).to_bytes(8, 'little') + bytes(24), id='asf-no-video'),
+    pytest.param(
+        _ASF_HEADER_GUID + (30).to_bytes(8, 'little') + bytes(6) + _ASF_VIDEO_MEDIA_GUID + bytes(8),
+        id='asf-video-outside-header',
+    ),
+    pytest.param(b'RIFF\x24\x00\x00\x00AVI LIST' + bytes(8), id='riff-avi'),
+    pytest.param(b'\x47\x40\x00\x10' + bytes(184) + b'\x47', id='mpeg-ts'),
+    pytest.param(
+        b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1' + bytes(504) + 'WordDocument'.encode('utf-16-le').ljust(128, b'\x00'),
+        id='ole-doc',
+    ),
+    pytest.param(b'RIFF\x24\x00\x00\x00WAVEfmt ' + bytes(24), id='wav'),
+    pytest.param(b'\xff\xfb\x90\x64' + bytes(32), id='mp3-frame'),
+    pytest.param('﻿hello world'.encode('utf-16-le'), id='utf16-text'),
+    pytest.param(b'\x00\x00\x00\x18fty', id='truncated-ftyp-box'),
+    pytest.param(b'\x00\x00\x00\x18ftyp', id='truncated-ftyp-brand'),
+    pytest.param(b'\x1a\x45\xdf\xa3', id='truncated-ebml'),
+    pytest.param(b'\x1a\x45\xdf\xa3\x42\x82', id='truncated-ebml-doctype'),
+    pytest.param(b'FLV\x01', id='truncated-flv'),
+    pytest.param(b'\x30\x26\xb2\x75', id='truncated-asf-guid'),
+    pytest.param(_ASF_HEADER_GUID, id='truncated-asf-header'),
+    pytest.param(b'PK\x03\x04', id='truncated-zip'),
+]
+
+
 class TestReadFile:
     async def test_read_basic(self, toolset: FileSystemToolset[None], ws: LocalWorkspaceBackend) -> None:
         result = await toolset.read_file('hello.txt', workspace=ws)
@@ -779,18 +871,8 @@ class TestReadFile:
             '... (68 more bytes)\n'
         )
 
-    @pytest.mark.parametrize(
-        ('data', 'media_type'),
-        [
-            (b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR', 'image/png'),
-            (b'\xff\xd8\xff\xe0\x00\x10JFIF', 'image/jpeg'),
-            (b'GIF89a\x01\x00\x01\x00', 'image/gif'),
-            (b'RIFF\x24\x00\x00\x00WEBPVP8 ', 'image/webp'),
-            # A PDF often has no null byte near the start, so it is recognized by its signature, not as binary.
-            (b'%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n', 'application/pdf'),
-        ],
-    )
-    async def test_read_image_or_pdf_returns_the_file(self, tmp_path: Path, data: bytes, media_type: str) -> None:
+    @pytest.mark.parametrize(('data', 'media_type'), MEDIA_FILES)
+    async def test_read_media_returns_the_file(self, tmp_path: Path, data: bytes, media_type: str) -> None:
         # The bytes decide the media type, not the extension.
         (tmp_path / 'upload.bin').write_bytes(data)
         toolset = _unhashed_toolset()
@@ -800,11 +882,69 @@ class TestReadFile:
             BinaryContent(data=data, media_type=media_type),
         ]
 
+    @pytest.mark.parametrize(('data', 'media_type'), MEDIA_FILES)
+    def test_read_media_types_are_ones_binary_content_maps(self, data: bytes, media_type: str) -> None:
+        # A media type outside these literals makes `BinaryContent.format` raise, which ends the run
+        # on every adapter that accepts the kind.
+        assert media_type in (
+            get_args(ImageMediaType) + get_args(DocumentMediaType) + get_args(VideoMediaType) + get_args(AudioMediaType)
+        )
+        assert BinaryContent(data=data, media_type=media_type).format
+
+    @pytest.mark.parametrize('data', NOT_MEDIA_FILES)
+    async def test_read_unrecognized_binary_is_described(self, tmp_path: Path, data: bytes) -> None:
+        # Deferred formats (audio, DOC), media types outside the literals and broken or truncated
+        # signatures are described, never sent; a short input without a null byte reads as text.
+        (tmp_path / 'upload.bin').write_bytes(data)
+        toolset = _unhashed_toolset()
+        result = await toolset.read_file('upload.bin', workspace=LocalWorkspaceBackend(tmp_path))
+        assert isinstance(result, str)
+        if b'\x00' in data:
+            assert result.startswith(
+                f'[upload.bin | application/octet-stream | {len(data)} bytes]\nBinary file; the first bytes in hex:\n'
+            )
+        else:
+            assert result.startswith('[upload.bin | 1 lines]\n')
+
+    @pytest.mark.parametrize(
+        'data',
+        [
+            pytest.param(b'FLV files are old\n', id='flv'),
+            pytest.param(b'ID3 tags are in the header\n', id='id3'),
+            pytest.param(b'RIFF and WAVE are words\n', id='riff'),
+            pytest.param(b'PK is a zip\n', id='zip'),
+            pytest.param(b'name,size\nclip.mp4,10\n', id='csv'),
+            pytest.param(b'<html><body>video</body></html>\n', id='html'),
+            pytest.param(b'# Notes\n', id='markdown'),
+        ],
+    )
+    async def test_read_text_that_starts_like_a_signature_stays_text(self, tmp_path: Path, data: bytes) -> None:
+        (tmp_path / 'upload.bin').write_bytes(data)
+        toolset = _unhashed_toolset()
+        result = await toolset.read_file('upload.bin', workspace=LocalWorkspaceBackend(tmp_path))
+        lines = data.decode().splitlines()
+        assert result == f'[upload.bin | {len(lines)} lines]\n' + ''.join(
+            f'{number:>6}\t{line}\n' for number, line in enumerate(lines, start=1)
+        )
+
     async def test_read_oversized_image_is_described(self, tmp_path: Path) -> None:
         (tmp_path / 'big.png').write_bytes(b'\x89PNG\r\n\x1a\n' + bytes(5_000_000))
         toolset = _unhashed_toolset()
         result = await toolset.read_file('big.png', workspace=LocalWorkspaceBackend(tmp_path))
         assert result == '[big.png | image/png | 5000008 bytes]\nToo large to view: the limit is 5000000 bytes.\n'
+
+    async def test_read_oversized_video_is_described(self, tmp_path: Path) -> None:
+        (tmp_path / 'big.mp4').write_bytes(_MP4.ljust(5_000_001, b'\x00'))
+        toolset = _unhashed_toolset()
+        result = await toolset.read_file('big.mp4', workspace=LocalWorkspaceBackend(tmp_path))
+        assert result == '[big.mp4 | video/mp4 | 5000001 bytes]\nToo large to view: the limit is 5000000 bytes.\n'
+
+    async def test_read_video_at_the_size_limit_returns_the_file(self, tmp_path: Path) -> None:
+        data = _MP4.ljust(5_000_000, b'\x00')
+        (tmp_path / 'big.mp4').write_bytes(data)
+        toolset = _unhashed_toolset()
+        result = await toolset.read_file('big.mp4', workspace=LocalWorkspaceBackend(tmp_path))
+        assert result == ['[big.mp4 | video/mp4 | 5000000 bytes]\n', BinaryContent(data=data, media_type='video/mp4')]
 
     async def test_limit_is_capped_by_max_read_lines(self, tmp_path: Path) -> None:
         (tmp_path / 'big.txt').write_text(''.join(f'line {number}\n' for number in range(50)))
@@ -2935,3 +3075,45 @@ class TestReadFileInARun:
             f'[chart.png | image/png | {len(png)} bytes | hash:{content_hash}]\n',
             BinaryContent(data=png, media_type='image/png'),
         ]
+
+    async def _read_video_in_a_run(
+        self, tmp_path: Path, profile: ModelProfile | None
+    ) -> tuple[ToolReturnPart, ToolReturnPart]:
+        """The `read_file` result the model received, and the one the run's history kept."""
+        (tmp_path / 'clip.mp4').write_bytes(_MP4)
+        received: list[ModelMessage] = []
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if len(messages) == 1:
+                return ModelResponse(parts=[ToolCallPart('read_file', {'path': 'clip.mp4'})])
+            received.extend(messages)
+            return ModelResponse(parts=[TextPart('seen')])
+
+        agent = Agent(
+            FunctionModel(model, profile=profile), capabilities=[LocalWorkspace(tmp_path), FileSystem[object]()]
+        )
+        result = await agent.run('watch the clip')
+        assert result.output == 'seen'
+        parts: list[ToolReturnPart] = []
+        for request in (received[2], result.all_messages()[2]):
+            assert isinstance(request, ModelRequest)
+            part = request.parts[0]
+            assert isinstance(part, ToolReturnPart)
+            parts.append(part)
+        return parts[0], parts[1]
+
+    async def test_video_the_model_cannot_read_reaches_it_as_a_note(self, tmp_path: Path) -> None:
+        received, kept = await self._read_video_in_a_run(tmp_path, ModelProfile(supports_video_input=False))
+        video = BinaryContent(data=_MP4, media_type='video/mp4')
+        header = f'[clip.mp4 | video/mp4 | {len(_MP4)} bytes | hash:{hashlib.sha256(_MP4).hexdigest()[:12]}]\n'
+        assert received.content == [
+            header,
+            f'File {video.identifier} (video/mp4, {len(_MP4)} bytes) was not sent: this model cannot read video.',
+        ]
+        # The note is only what the model receives: the run's history keeps the file.
+        assert kept.content == [header, video]
+
+    async def test_video_the_model_can_read_reaches_it_as_the_file(self, tmp_path: Path) -> None:
+        received, kept = await self._read_video_in_a_run(tmp_path, None)
+        header = f'[clip.mp4 | video/mp4 | {len(_MP4)} bytes | hash:{hashlib.sha256(_MP4).hexdigest()[:12]}]\n'
+        assert received.content == kept.content == [header, BinaryContent(data=_MP4, media_type='video/mp4')]
