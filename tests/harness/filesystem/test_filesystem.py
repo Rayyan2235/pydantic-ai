@@ -715,6 +715,13 @@ def _zip(*names: str) -> bytes:
     return buffer.getvalue()
 
 
+def _needing_zip_version(data: bytes, version: int) -> bytes:
+    """`data` with its first central-directory entry's "version needed to extract" set to `version`."""
+    patched = bytearray(data)
+    patched[patched.find(b'PK\x01\x02') + 6] = version
+    return bytes(patched)
+
+
 _MP4 = b'\x00\x00\x00\x18ftypisom' + bytes(12)
 _DOCX = _zip('[Content_Types].xml', 'word/document.xml')
 _ASF_HEADER_GUID = bytes.fromhex('3026b2758e66cf11a6d900aa0062ce6c')
@@ -771,6 +778,8 @@ NOT_MEDIA_FILES = [
     pytest.param(_zip('[Content_Types].xml', 'ppt/presentation.xml'), id='pptx'),
     pytest.param(b'PK\x03\x04' + bytes(40), id='zip-corrupt'),
     pytest.param(_DOCX[: len(_DOCX) // 2], id='zip-truncated'),
+    # `zipfile` refuses an entry that needs a newer version to extract with `NotImplementedError`.
+    pytest.param(_needing_zip_version(_DOCX, 80), id='zip-unsupported-version'),
     pytest.param(b'\x00\x00\x00\x18ftypM4A ' + bytes(12), id='ftyp-m4a'),
     pytest.param(b'\x00\x00\x00\x18ftypheic' + bytes(12), id='ftyp-heic'),
     pytest.param(b'\x00\x00\x00\x18ftypavif' + bytes(12), id='ftyp-avif'),
@@ -797,6 +806,7 @@ NOT_MEDIA_FILES = [
     pytest.param(b'\xff\xfe' + 'hello world'.encode('utf-16-le'), id='utf16-text'),
     pytest.param(b'\x00\x00\x00\x18fty', id='truncated-ftyp-box'),
     pytest.param(b'\x00\x00\x00\x18ftyp', id='truncated-ftyp-brand'),
+    pytest.param(b'\x00\x00\x00\x14ftyp3gp', id='truncated-3gp-brand'),
     pytest.param(b'\x1a\x45\xdf\xa3', id='truncated-ebml'),
     pytest.param(b'\x1a\x45\xdf\xa3\x42\x82', id='truncated-ebml-doctype'),
     pytest.param(b'FLV\x01', id='truncated-flv'),
@@ -931,6 +941,7 @@ class TestReadFile:
             pytest.param(b'name,size\nclip.mp4,10\n', id='csv'),
             pytest.param(b'<html><body>video</body></html>\n', id='html'),
             pytest.param(b'# Notes\n', id='markdown'),
+            pytest.param(b'The ftypisom box is first\n', id='ftyp'),
         ],
     )
     async def test_read_text_that_starts_like_a_signature_stays_text(self, tmp_path: Path, data: bytes) -> None:
@@ -960,6 +971,22 @@ class TestReadFile:
         toolset = _unhashed_toolset()
         result = await toolset.read_file('big.mp4', workspace=LocalWorkspaceBackend(tmp_path))
         assert result == ['[big.mp4 | video/mp4 | 5000000 bytes]\n', BinaryContent(data=data, media_type='video/mp4')]
+
+    async def test_read_oversized_zip_is_described_without_reading_its_entries(self, tmp_path: Path) -> None:
+        # A ZIP over the media limit could not be sent anyway, so its central directory, which can
+        # hold millions of entries, is not parsed: even an otherwise valid DOCX is described in hex.
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w') as archive:
+            archive.writestr('[Content_Types].xml', '<x/>')
+            archive.writestr('word/document.xml', bytes(5_000_000))
+        data = buffer.getvalue()
+        (tmp_path / 'upload.bin').write_bytes(data)
+        toolset = _unhashed_toolset()
+        result = await toolset.read_file('upload.bin', workspace=LocalWorkspaceBackend(tmp_path))
+        assert isinstance(result, str)
+        assert result.startswith(
+            f'[upload.bin | application/octet-stream | {len(data)} bytes]\nBinary file; the first bytes in hex:\n'
+        )
 
     async def test_limit_is_capped_by_max_read_lines(self, tmp_path: Path) -> None:
         (tmp_path / 'big.txt').write_text(''.join(f'line {number}\n' for number in range(50)))
