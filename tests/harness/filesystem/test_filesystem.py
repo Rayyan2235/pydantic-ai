@@ -728,8 +728,13 @@ MEDIA_FILES = [
     # A PDF often has no null byte near the start, so it is recognized by its signature, not as binary.
     pytest.param(b'%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n', 'application/pdf', id='pdf'),
     pytest.param(_MP4, 'video/mp4', id='mp4'),
+    pytest.param(b'\x00\x00\x00\x18ftypmp42' + bytes(12), 'video/mp4', id='mp4-mp42'),
+    pytest.param(b'\x00\x00\x00\x18ftypavc1' + bytes(12), 'video/mp4', id='mp4-avc1'),
+    pytest.param(b'\x00\x00\x00\x18ftypM4V ' + bytes(12), 'video/mp4', id='mp4-m4v'),
+    pytest.param(b'\x00\x00\x00\x18ftypdash' + bytes(12), 'video/mp4', id='mp4-dash'),
     pytest.param(b'\x00\x00\x00\x14ftypqt  ' + bytes(8), 'video/quicktime', id='mov'),
     pytest.param(b'\x00\x00\x00\x14ftyp3gp5' + bytes(8), 'video/3gpp', id='3gp'),
+    pytest.param(b'\x00\x00\x00\x14ftyp3gg6' + bytes(8), 'video/3gpp', id='3gp-3gg6'),
     pytest.param(b'\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01\x42\x82\x84webm' + bytes(16), 'video/webm', id='webm'),
     pytest.param(b'\x1a\x45\xdf\xa3\xa3\x42\x86\x81\x01\x42\x82\x88matroska' + bytes(16), 'video/x-matroska', id='mkv'),
     # `webm` in a Void element before the DocType does not decide: only the DocType does.
@@ -738,7 +743,13 @@ MEDIA_FILES = [
         'video/x-matroska',
         id='ebml-webm-elsewhere',
     ),
+    pytest.param(
+        b'\x1a\x45\xdf\xa3\xa8\xec\x88matroska\x42\x82\x84webm' + bytes(16),
+        'video/webm',
+        id='ebml-matroska-elsewhere',
+    ),
     pytest.param(b'FLV\x01\x05\x00\x00\x00\x09' + bytes(8), 'video/x-flv', id='flv'),
+    pytest.param(b'FLV\x01\x01\x00\x00\x00\x09' + bytes(8), 'video/x-flv', id='flv-video-only'),
     pytest.param(b'\x00\x00\x01\xba\x44\x00\x04\x00' + bytes(8), 'video/mpeg', id='mpeg-ps'),
     pytest.param(b'\x00\x00\x01\xb3\x16\x00\xf0\x15' + bytes(8), 'video/mpeg', id='mpeg-es'),
     pytest.param(
@@ -765,6 +776,10 @@ NOT_MEDIA_FILES = [
     pytest.param(b'\x00\x00\x00\x18ftypavif' + bytes(12), id='ftyp-avif'),
     pytest.param(b'\x00\x00\x00\x18ftyp3g2a' + bytes(12), id='ftyp-3g2'),
     pytest.param(b'\x1a\x45\xdf\xa3\x9b\x42\x86\x81\x01\x42\x82\x84abcd' + bytes(16), id='ebml-unknown'),
+    # The DocType is only looked for in the first 64 bytes.
+    pytest.param(b'\x1a\x45\xdf\xa3\xc4\xec\xbc' + bytes(60) + b'\x42\x82\x84webm' + bytes(16), id='ebml-doctype-late'),
+    # An icon starts `00 00 01 00`, so a check on the first three bytes alone would call it MPEG.
+    pytest.param(b'\x00\x00\x01\x00\x01\x00\x10\x10\x00\x00\x01\x00\x20\x00' + bytes(16), id='ico'),
     pytest.param(b'FLV\x01\x04\x00\x00\x00\x09' + bytes(8), id='flv-audio-only'),
     pytest.param(_ASF_HEADER_GUID + (40).to_bytes(8, 'little') + bytes(24), id='asf-no-video'),
     pytest.param(
@@ -779,7 +794,7 @@ NOT_MEDIA_FILES = [
     ),
     pytest.param(b'RIFF\x24\x00\x00\x00WAVEfmt ' + bytes(24), id='wav'),
     pytest.param(b'\xff\xfb\x90\x64' + bytes(32), id='mp3-frame'),
-    pytest.param('﻿hello world'.encode('utf-16-le'), id='utf16-text'),
+    pytest.param(b'\xff\xfe' + 'hello world'.encode('utf-16-le'), id='utf16-text'),
     pytest.param(b'\x00\x00\x00\x18fty', id='truncated-ftyp-box'),
     pytest.param(b'\x00\x00\x00\x18ftyp', id='truncated-ftyp-brand'),
     pytest.param(b'\x1a\x45\xdf\xa3', id='truncated-ebml'),
@@ -3108,7 +3123,7 @@ class TestReadFileInARun:
         header = f'[clip.mp4 | video/mp4 | {len(_MP4)} bytes | hash:{hashlib.sha256(_MP4).hexdigest()[:12]}]\n'
         assert received.content == [
             header,
-            f'File {video.identifier} (video/mp4, {len(_MP4)} bytes) was not sent: this model cannot read video.',
+            f'File {video.identifier} (video/mp4, {len(_MP4):,} bytes) was not sent: this model cannot read video.',
         ]
         # The note is only what the model receives: the run's history keeps the file.
         assert kept.content == [header, video]
