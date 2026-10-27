@@ -170,8 +170,8 @@ def paths_read(messages: list[ModelMessage]) -> list[str]:
 whose outcome is `'success'`, which includes a `Path not found: <path>` result and the
 description `read_file` returns for a file over 64 MiB, so neither means the file's content was read.
 Its `content` is the text with its header, or `[header, BinaryContent]` for a
-file it returns as file content. The kind declares no content shape, since `ToolKind` takes a class
-and not a union, so `typed_content` is untyped. The other tools return text
+file `read_file` returns as file content. The kind declares no content shape, since
+`ToolKind` takes a class and not a union, so `typed_content` is untyped. The other tools return text
 written for the model rather than a format to parse, so their returns stay plain
 `ToolReturnPart`s that carry the kind as `tool_kind`; the [events](#events)
 carry their outcomes as structured data.
@@ -347,12 +347,14 @@ applies the same rule to absolute symlink targets.
   context. It returns an image (PNG, JPEG, GIF, WebP), PDF, Word or Excel
   document (DOCX, XLSX) or video (MP4, MOV, 3GP, WebM, MKV, FLV, MPEG, WMV) as
   `BinaryContent`, recognized by its leading bytes rather than its extension,
-  which Pydantic AI sends [inside the tool result or on the user channel](../tools-advanced.md#tool-return-file-provenance)
+  which Pydantic AI sends inside the tool result or on the user channel
   depending on the model. A model whose profile says it can't read that kind of
-  file gets a note naming the file in its place, or a description with
-  [`FileUnderstanding`](../capabilities/file-understanding.md). Audio, DOC and XLS files are
-  still described: a tool-returned audio file ends the run on
-  `OpenAIChatModel`, and DOC and XLS share one container format. A file over
+  file gets [a note naming the file](../tools-advanced.md#tool-return-file-provenance) in its place, or a description
+  with [`FileUnderstanding`](../capabilities/file-understanding.md). A provider can
+  still reject a file its profile allows, such as video on Bedrock with Claude
+  models. Audio, DOC and XLS files are still described: a tool-returned audio
+  file ends the run on `OpenAIChatModel` and models built on it, such as
+  `OpenRouterModel`, and DOC and XLS share one container format. A file over
   5 MB, the strictest mainstream per-image limit, is described instead, as is
   any other binary file.
 - **Optimistic concurrency.** `write_file`/`edit_file` accept an

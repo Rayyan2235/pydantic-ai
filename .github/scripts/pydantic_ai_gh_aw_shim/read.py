@@ -71,9 +71,9 @@ def _fit_to_output_budget(prefix: str, body: str) -> str:
 async def read_file(
     ctx: RunContext[object], file_path: str, offset: int | None = None, limit: int | None = None
 ) -> str | list[str | BinaryContent]:
-    """Read a UTF-8 text file, or view an image, PDF, document or video. Relative paths resolve under the workspace.
+    """Read a UTF-8 text file, or view an image, PDF, Word or Excel document, or video.
 
-    Optional 1-based line `offset` and line `limit` mirror Claude's Read tool.
+    Relative paths resolve under the workspace. Optional 1-based line `offset` and line `limit` mirror Claude's Read tool.
     """
     # Claude's `offset` is a 1-based line number; the harness uses a 0-based offset.
     zero_based = max((offset or 1) - 1, 0)
