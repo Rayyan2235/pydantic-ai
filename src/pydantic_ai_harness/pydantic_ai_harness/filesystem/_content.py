@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import zipfile
 from collections.abc import Sequence
 from dataclasses import KW_ONLY, dataclass
 
@@ -69,24 +71,43 @@ def is_binary(data: bytes, sample_size: int = 8192) -> bool:
 
 
 MAX_MEDIA_BYTES = 5_000_000
-"""Largest image or PDF `read_file` returns as file content.
+"""Largest file `read_file` returns as file content.
 
-File content bypasses the textual `max_read_chars` budget, and 5 MB is the
-strictest per-image limit among mainstream providers. A larger file gets the
-text description instead of content that would fail the next model request.
+File content bypasses the textual `max_read_chars` budget. 5 MB is the strictest
+mainstream per-image limit. Some providers cap other kinds lower or higher, and a
+larger file gets the text description instead.
 """
 
 _HEX_PREVIEW_BYTES = 64
 """Leading bytes of a non-media binary file shown as hex."""
 
+_MP4_BRANDS = frozenset(
+    {b'isom', b'iso2', b'iso3', b'iso4', b'iso5', b'iso6', b'mp41', b'mp42', b'avc1', b'M4V ', b'dash', b'mmp4'}
+)
+"""`ftyp` major brands of MP4 video. Other brands (HEIC, AVIF, M4A, 3G2) are not a video `BinaryContent` maps."""
+
+_EBML_DOC_TYPES = {b'\x84webm': 'video/webm', b'\x88matroska': 'video/x-matroska'}
+"""EBML DocType values, each with its one-byte size, and the media type they name."""
+
+_ASF_HEADER_GUID = bytes.fromhex('3026b2758e66cf11a6d900aa0062ce6c')
+_ASF_VIDEO_MEDIA_GUID = bytes.fromhex('c0ef19bc4d5bcf11a8fd00805f5c442b')
+"""The stream type of a video stream in an ASF header object; WMA has none."""
+
+_DOCX_MEDIA_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+_XLSX_MEDIA_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+
 
 def sniff_media_type(data: bytes) -> str | None:
-    """The media type of an image or PDF, read from its leading bytes.
+    """The media type of a file `read_file` returns as file content, read from its leading bytes.
 
-    Only images and PDFs are returned as files: most models with file input take
-    them, while audio, video and office documents fail on several default
-    providers until a model can report which files it accepts. The bytes decide,
-    not the extension, so a misnamed file is not sent under the wrong media type.
+    These are images, PDFs, video, and Word and Excel documents: the kinds core's
+    `BinaryContent` maps, where a model whose profile refuses the kind gets core's
+    note naming the file instead. The bytes decide, not the extension, so a
+    misnamed file is not sent under the wrong media type.
+
+    Some formats stay described in text. Audio ends the run on `OpenAIChatModel`,
+    which core doesn't replace with the note yet. DOC and XLS share one container
+    that only a walk of its directory tells apart.
 
     The image signatures duplicate core's `image_media_type_from_bytes`
     (`pydantic_ai/images/_media_type.py`), which is private and covers neither GIF
@@ -102,6 +123,53 @@ def sniff_media_type(data: bytes) -> str | None:
         return 'image/webp'
     if data.startswith(b'%PDF-'):
         return 'application/pdf'
+    if data[4:8] == b'ftyp':
+        return _ftyp_video_type(data[8:12])
+    if data.startswith(b'\x1a\x45\xdf\xa3'):
+        return _ebml_video_type(data)
+    if data.startswith(b'FLV\x01') and len(data) > 4 and data[4] & 0x01:
+        return 'video/x-flv'
+    if data.startswith((b'\x00\x00\x01\xba', b'\x00\x00\x01\xb3')):
+        return 'video/mpeg'
+    if data.startswith(_ASF_HEADER_GUID) and _ASF_VIDEO_MEDIA_GUID in data[: int.from_bytes(data[16:24], 'little')]:
+        return 'video/x-ms-wmv'
+    if data.startswith(b'PK\x03\x04'):
+        return _ooxml_type(data)
+    return None
+
+
+def _ftyp_video_type(brand: bytes) -> str | None:
+    if brand in _MP4_BRANDS:
+        return 'video/mp4'
+    if brand == b'qt  ':
+        return 'video/quicktime'
+    if brand.startswith(b'3gp') or brand == b'3gg6':
+        return 'video/3gpp'
+    return None
+
+
+def _ebml_video_type(data: bytes) -> str | None:
+    """WebM or Matroska, from the DocType element of the EBML header in the first 64 bytes."""
+    start = data.find(b'\x42\x82', 4, 64)
+    if start == -1:
+        return None
+    value = data[start + 2 :]
+    return next((media_type for doc_type, media_type in _EBML_DOC_TYPES.items() if value.startswith(doc_type)), None)
+
+
+def _ooxml_type(data: bytes) -> str | None:
+    """DOCX or XLSX, from the part names in the ZIP central directory; nothing is decompressed."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            names = set(archive.namelist())
+    except (zipfile.BadZipFile, ValueError, EOFError):
+        return None
+    if '[Content_Types].xml' not in names:
+        return None
+    if 'word/document.xml' in names:
+        return _DOCX_MEDIA_TYPE
+    if 'xl/workbook.xml' in names:
+        return _XLSX_MEDIA_TYPE
     return None
 
 
