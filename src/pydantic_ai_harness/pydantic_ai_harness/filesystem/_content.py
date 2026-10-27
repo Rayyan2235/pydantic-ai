@@ -84,7 +84,7 @@ _HEX_PREVIEW_BYTES = 64
 _MP4_BRANDS = frozenset(
     {b'isom', b'iso2', b'iso3', b'iso4', b'iso5', b'iso6', b'mp41', b'mp42', b'avc1', b'M4V ', b'dash', b'mmp4'}
 )
-"""`ftyp` major brands of MP4 video. Other brands (HEIC, AVIF, M4A, 3G2) are not a video `BinaryContent` maps."""
+"""`ftyp` major brands of MP4 video. Other brands (HEIC, AVIF, M4A, 3G2) are not video types `BinaryContent` maps."""
 
 _EBML_DOC_TYPES = {b'\x84webm': 'video/webm', b'\x88matroska': 'video/x-matroska'}
 """EBML DocType values, each with its one-byte size, and the media type they name."""
@@ -105,9 +105,11 @@ def sniff_media_type(data: bytes) -> str | None:
     note naming the file instead. The bytes decide, not the extension, so a
     misnamed file is not sent under the wrong media type.
 
-    Some formats stay described in text. Audio ends the run on `OpenAIChatModel`,
-    which core doesn't replace with the note yet. DOC and XLS share one container
-    that only a walk of its directory tells apart.
+    Some formats stay described in text. Audio ends the run on `OpenAIChatModel`
+    and models built on it, which core doesn't replace with the note yet. DOC and
+    XLS share one container that only a walk of its directory tells apart. A ZIP
+    over `MAX_MEDIA_BYTES` is not opened: it would be described anyway, and a large
+    central directory takes seconds to parse.
 
     The image signatures duplicate core's `image_media_type_from_bytes`
     (`pydantic_ai/images/_media_type.py`), which is private and covers neither GIF
@@ -123,7 +125,8 @@ def sniff_media_type(data: bytes) -> str | None:
         return 'image/webp'
     if data.startswith(b'%PDF-'):
         return 'application/pdf'
-    if data[4:8] == b'ftyp':
+    # An `ftyp` box comes first and is far smaller than 64 KiB, so its size starts with two zero bytes.
+    if data[:2] == b'\x00\x00' and data[4:8] == b'ftyp':
         return _ftyp_video_type(data[8:12])
     if data.startswith(b'\x1a\x45\xdf\xa3'):
         return _ebml_video_type(data)
@@ -133,7 +136,7 @@ def sniff_media_type(data: bytes) -> str | None:
         return 'video/mpeg'
     if data.startswith(_ASF_HEADER_GUID) and _ASF_VIDEO_MEDIA_GUID in data[: int.from_bytes(data[16:24], 'little')]:
         return 'video/x-ms-wmv'
-    if data.startswith(b'PK\x03\x04'):
+    if data.startswith(b'PK\x03\x04') and len(data) <= MAX_MEDIA_BYTES:
         return _ooxml_type(data)
     return None
 
@@ -143,7 +146,7 @@ def _ftyp_video_type(brand: bytes) -> str | None:
         return 'video/mp4'
     if brand == b'qt  ':
         return 'video/quicktime'
-    if brand.startswith(b'3gp') or brand == b'3gg6':
+    if (len(brand) == 4 and brand.startswith(b'3gp')) or brand == b'3gg6':
         return 'video/3gpp'
     return None
 
@@ -162,7 +165,7 @@ def _ooxml_type(data: bytes) -> str | None:
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             names = set(archive.namelist())
-    except (zipfile.BadZipFile, ValueError, EOFError):
+    except (zipfile.BadZipFile, NotImplementedError, ValueError, EOFError):
         return None
     if '[Content_Types].xml' not in names:
         return None
